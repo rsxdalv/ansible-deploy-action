@@ -13,6 +13,9 @@
 #         webhook-url: ${{ secrets.DEPLOY_WEBHOOK_URL }}
 #         service: my-service-name       # optional — defaults to repo name
 #         version: ${{ steps.build.outputs.version }}   # optional — defaults to 'latest'
+#         package: my-apt-package        # optional — override apt package name
+#                                        #   use with service: apt-install for repos
+#                                        #   not registered in services.js
 #         # Optional GitHub Deployment tracking:
 #         create-deployment: 'true'
 #         token: ${{ secrets.GITHUB_TOKEN }}
@@ -30,12 +33,20 @@ inputs:
     description: |
       Name of the service to deploy, as registered in services.js on the server.
       Defaults to the calling repository name (without the org prefix).
+      Use 'apt-install' to install any apt package without a dedicated services.js entry.
     required: false
     default: ''
   version:
     description: 'Version string to deploy (e.g. 1.2.3 or a package version from a build step)'
     required: false
     default: 'latest'
+  package:
+    description: |
+      Override the apt package name passed to Ansible.
+      When omitted the package defaults to the service name.
+      Required when service is 'apt-install' and the package name differs from the repo name.
+    required: false
+    default: ''
 
   # ── Optional GitHub Deployment tracking ────────────────────────────────────
   create-deployment:
@@ -107,27 +118,33 @@ runs:
         WEBHOOK_URL: ${{ inputs.webhook-url }}
         SERVICE: ${{ inputs.service }}
         VERSION: ${{ inputs.version }}
+        PACKAGE: ${{ inputs.package }}
       run: |
         # Default service name = repo name (strip org/ prefix)
         [ -z "$SERVICE" ] && SERVICE="${GITHUB_REPOSITORY##*/}"
 
-        echo "→ service=${SERVICE}  version=${VERSION}"
+        echo "→ service=${SERVICE}  version=${VERSION}  package=${PACKAGE:-<same as service>}"
+
+        # Build JSON body — include 'package' only when explicitly set
+        BODY="{\"version\":\"${VERSION}\""
+        [ -n "$PACKAGE" ] && BODY="${BODY},\"package\":\"${PACKAGE}\""
+        BODY="${BODY}}"
 
         RESP=$(curl -s -w "\n%{http_code}" \
           -X POST "${WEBHOOK_URL}/deploy/${SERVICE}" \
           -H "Authorization: Bearer ${TOKEN}" \
           -H "Content-Type: application/json" \
-          -d "{\"version\": \"${VERSION}\"}")
+          -d "${BODY}")
 
-        BODY=$(echo "$RESP" | head -n -1)
+        BODY_OUT=$(echo "$RESP" | head -n -1)
         CODE=$(echo "$RESP" | tail -n1)
 
         echo "HTTP ${CODE}"
-        echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
-        echo "response=${BODY}" >> "$GITHUB_OUTPUT"
+        echo "$BODY_OUT" | jq . 2>/dev/null || echo "$BODY_OUT"
+        echo "response=${BODY_OUT}" >> "$GITHUB_OUTPUT"
 
         if [ "$CODE" != "200" ]; then
-          echo "::error::Deploy webhook returned HTTP ${CODE}: $(echo $BODY | jq -r '.detail // .error // .' 2>/dev/null)"
+          echo "::error::Deploy webhook returned HTTP ${CODE}: $(echo $BODY_OUT | jq -r '.detail // .error // .' 2>/dev/null)"
           exit 1
         fi
 
