@@ -3,15 +3,21 @@
 # Usage:
 #
 #   permissions:
-#     id-token: write   # required to mint the OIDC JWT
+#     id-token: write       # required to mint the OIDC JWT
 #     contents: read
+#     deployments: write    # required only when create-deployment: 'true'
 #
 #   steps:
-#     - uses: rsxdalv/deploy-action@v1
+#     - uses: rsxdalv/ansible-deploy-action@v1
 #       with:
 #         webhook-url: ${{ secrets.DEPLOY_WEBHOOK_URL }}
 #         service: my-service-name       # optional — defaults to repo name
 #         version: ${{ steps.build.outputs.version }}   # optional — defaults to 'latest'
+#         # Optional GitHub Deployment tracking:
+#         create-deployment: 'true'
+#         token: ${{ secrets.GITHUB_TOKEN }}
+#         env: production
+#         env-url: https://my-service.example.com/
 
 name: 'Ansible Deploy'
 description: 'Deploy a service via GitHub OIDC-authenticated webhook'
@@ -31,14 +37,48 @@ inputs:
     required: false
     default: 'latest'
 
+  # ── Optional GitHub Deployment tracking ────────────────────────────────────
+  create-deployment:
+    description: |
+      When 'true', creates a GitHub Deployment record before deploying and
+      updates it (success/failure) after. Requires deployments: write permission
+      on the calling job and a token input.
+    required: false
+    default: 'false'
+  token:
+    description: 'GITHUB_TOKEN for creating/updating GitHub Deployment records (required when create-deployment is true)'
+    required: false
+    default: ''
+  env:
+    description: 'GitHub Deployment environment name (used when create-deployment is true)'
+    required: false
+    default: 'production'
+  env-url:
+    description: 'URL shown on the GitHub Deployments tab (optional, used when create-deployment is true)'
+    required: false
+    default: ''
+
 outputs:
   response:
     description: 'JSON response body from the webhook'
     value: ${{ steps.deploy.outputs.response }}
+  deployment-id:
+    description: 'GitHub Deployment ID (only set when create-deployment is true)'
+    value: ${{ steps.deployment-start.outputs.deployment_id }}
 
 runs:
   using: 'composite'
   steps:
+    # ── 0. Create GitHub Deployment record (opt-in) ──────────────────────────
+    - name: Create GitHub Deployment
+      if: inputs.create-deployment == 'true'
+      uses: bobheadxi/deployments@v1
+      id: deployment-start
+      with:
+        step: start
+        token: ${{ inputs.token }}
+        env: ${{ inputs.env }}
+
     # ── 1. Obtain GitHub OIDC token ─────────────────────────────────────────
     # Requires the calling workflow job to have: permissions: id-token: write
     - name: Fetch OIDC token
@@ -90,3 +130,15 @@ runs:
           echo "::error::Deploy webhook returned HTTP ${CODE}: $(echo $BODY | jq -r '.detail // .error // .' 2>/dev/null)"
           exit 1
         fi
+
+    # ── 3. Update GitHub Deployment record (opt-in) ─────────────────────────
+    - name: Update GitHub Deployment status
+      if: always() && inputs.create-deployment == 'true'
+      uses: bobheadxi/deployments@v1
+      with:
+        step: finish
+        token: ${{ inputs.token }}
+        status: ${{ job.status }}
+        deployment_id: ${{ steps.deployment-start.outputs.deployment_id }}
+        env: ${{ inputs.env }}
+        env_url: ${{ inputs.env-url }}
