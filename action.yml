@@ -1,0 +1,92 @@
+# Composite action — deploy a service via OIDC-authenticated webhook.
+#
+# Usage:
+#
+#   permissions:
+#     id-token: write   # required to mint the OIDC JWT
+#     contents: read
+#
+#   steps:
+#     - uses: rsxdalv/deploy-action@v1
+#       with:
+#         webhook-url: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+#         service: my-service-name       # optional — defaults to repo name
+#         version: ${{ steps.build.outputs.version }}   # optional — defaults to 'latest'
+
+name: 'Ansible Deploy'
+description: 'Deploy a service via GitHub OIDC-authenticated webhook'
+
+inputs:
+  webhook-url:
+    description: 'Base URL of the deployment webhook (e.g. https://ansible.ttswebui.com)'
+    required: true
+  service:
+    description: |
+      Name of the service to deploy, as registered in services.js on the server.
+      Defaults to the calling repository name (without the org prefix).
+    required: false
+    default: ''
+  version:
+    description: 'Version string to deploy (e.g. 1.2.3 or a package version from a build step)'
+    required: false
+    default: 'latest'
+
+outputs:
+  response:
+    description: 'JSON response body from the webhook'
+    value: ${{ steps.deploy.outputs.response }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── 1. Obtain GitHub OIDC token ─────────────────────────────────────────
+    # Requires the calling workflow job to have: permissions: id-token: write
+    - name: Fetch OIDC token
+      id: oidc
+      shell: bash
+      run: |
+        TOKEN=$(curl -sf \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oidc-deploy-webhook" \
+          | jq -r '.value')
+
+        if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+          echo "::error::Failed to obtain OIDC token — ensure permissions: id-token: write is set"
+          exit 1
+        fi
+
+        echo "::add-mask::${TOKEN}"
+        echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+    # ── 2. POST to webhook ──────────────────────────────────────────────────
+    - name: Deploy via webhook
+      id: deploy
+      shell: bash
+      env:
+        TOKEN: ${{ steps.oidc.outputs.token }}
+        WEBHOOK_URL: ${{ inputs.webhook-url }}
+        SERVICE: ${{ inputs.service }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        # Default service name = repo name (strip org/ prefix)
+        [ -z "$SERVICE" ] && SERVICE="${GITHUB_REPOSITORY##*/}"
+
+        echo "→ service=${SERVICE}  version=${VERSION}"
+
+        RESP=$(curl -s -w "\n%{http_code}" \
+          -X POST "${WEBHOOK_URL}/deploy/${SERVICE}" \
+          -H "Authorization: Bearer ${TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "{\"version\": \"${VERSION}\"}")
+
+        BODY=$(echo "$RESP" | head -n -1)
+        CODE=$(echo "$RESP" | tail -n1)
+
+        echo "HTTP ${CODE}"
+        echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+        echo "response=${BODY}" >> "$GITHUB_OUTPUT"
+
+        if [ "$CODE" != "200" ]; then
+          echo "::error::Deploy webhook returned HTTP ${CODE}: $(echo $BODY | jq -r '.detail // .error // .' 2>/dev/null)"
+          exit 1
+        fi
