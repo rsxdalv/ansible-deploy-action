@@ -120,6 +120,12 @@ runs:
         VERSION: ${{ inputs.version }}
         PACKAGE: ${{ inputs.package }}
       run: |
+        # Normalize webhook URL: add https:// scheme if missing, strip trailing
+        # slash.  Bare hostnames default to HTTP and receive a 301 redirect;
+        # curl does not follow redirects by default so the POST is never sent.
+        [[ "$WEBHOOK_URL" != http://* && "$WEBHOOK_URL" != https://* ]] && WEBHOOK_URL="https://$WEBHOOK_URL"
+        WEBHOOK_URL="${WEBHOOK_URL%/}"
+
         # Default service name = repo name (strip org/ prefix)
         [ -z "$SERVICE" ] && SERVICE="${GITHUB_REPOSITORY##*/}"
 
