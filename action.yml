@@ -21,6 +21,12 @@
 #         token: ${{ secrets.GITHUB_TOKEN }}
 #         env: production
 #         env-url: https://my-service.example.com/
+#
+# Behavior when the webhook queues the deploy for approval (HTTP 202):
+# - The job waits 60 seconds, then polls GET /deploy-status/:queueId using a
+#   fresh short-lived OIDC token (no PAT, no stored credential needed).
+# - Exits 0 if approved+running or success; exits 1 if still pending/denied/failed.
+# - GitHub Deployment record is updated by job.status at the end (step 3).
 
 name: 'Ansible Deploy'
 description: 'Deploy a service via GitHub OIDC-authenticated webhook'
@@ -52,8 +58,8 @@ inputs:
   create-deployment:
     description: |
       When 'true', creates a GitHub Deployment record before deploying and
-      updates it (success/failure) after. Requires deployments: write permission
-      on the calling job and a token input.
+      updates it after. Requires deployments: write permission on the calling
+      job and a token input.
     required: false
     default: 'false'
   token:
@@ -73,6 +79,15 @@ outputs:
   response:
     description: 'JSON response body from the webhook'
     value: ${{ steps.deploy.outputs.response }}
+  status:
+    description: 'Webhook response status: ok | pending-approval'
+    value: ${{ steps.deploy.outputs.status }}
+  queue-id:
+    description: 'Queue ID returned when status is pending-approval'
+    value: ${{ steps.deploy.outputs.queue-id }}
+  http-code:
+    description: 'HTTP status code returned by the webhook'
+    value: ${{ steps.deploy.outputs.http-code }}
   deployment-id:
     description: 'GitHub Deployment ID (only set when create-deployment is true)'
     value: ${{ steps.deployment-start.outputs.deployment_id }}
@@ -120,9 +135,7 @@ runs:
         VERSION: ${{ inputs.version }}
         PACKAGE: ${{ inputs.package }}
       run: |
-        # Normalize webhook URL: add https:// scheme if missing, strip trailing
-        # slash.  Bare hostnames default to HTTP and receive a 301 redirect;
-        # curl does not follow redirects by default so the POST is never sent.
+        # Normalize webhook URL: add https:// scheme if missing, strip trailing slash
         [[ "$WEBHOOK_URL" != http://* && "$WEBHOOK_URL" != https://* ]] && WEBHOOK_URL="https://$WEBHOOK_URL"
         WEBHOOK_URL="${WEBHOOK_URL%/}"
 
@@ -131,30 +144,96 @@ runs:
 
         echo "→ service=${SERVICE}  version=${VERSION}  package=${PACKAGE:-<same as service>}"
 
-        # Build JSON body — include 'package' only when explicitly set
-        BODY="{\"version\":\"${VERSION}\""
-        [ -n "$PACKAGE" ] && BODY="${BODY},\"package\":\"${PACKAGE}\""
-        BODY="${BODY}}"
+        # Build the JSON body. Include package only when non-empty.
+        BODY_JSON=$(jq -n \
+          --arg version "$VERSION" \
+          --arg package "$PACKAGE" \
+          '{version: $version} + (if $package != "" then {package: $package} else {} end)')
 
         RESP=$(curl -s -w "\n%{http_code}" \
           -X POST "${WEBHOOK_URL}/deploy/${SERVICE}" \
           -H "Authorization: Bearer ${TOKEN}" \
           -H "Content-Type: application/json" \
-          -d "${BODY}")
+          -d "$BODY_JSON")
 
-        BODY_OUT=$(echo "$RESP" | head -n -1)
+        BODY=$(echo "$RESP" | head -n -1)
         CODE=$(echo "$RESP" | tail -n1)
 
         echo "HTTP ${CODE}"
-        echo "$BODY_OUT" | jq . 2>/dev/null || echo "$BODY_OUT"
-        echo "response=${BODY_OUT}" >> "$GITHUB_OUTPUT"
+        echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+        echo "response=${BODY}"   >> "$GITHUB_OUTPUT"
+        echo "http-code=${CODE}" >> "$GITHUB_OUTPUT"
 
-        if [ "$CODE" != "200" ]; then
-          echo "::error::Deploy webhook returned HTTP ${CODE}: $(echo $BODY_OUT | jq -r '.detail // .error // .' 2>/dev/null)"
+        STATUS=$(echo "$BODY"  | jq -r '.status    // empty' 2>/dev/null || echo "")
+        QUEUE_ID=$(echo "$BODY" | jq -r '.queueId  // empty' 2>/dev/null || echo "")
+        echo "status=${STATUS}"     >> "$GITHUB_OUTPUT"
+        echo "queue-id=${QUEUE_ID}" >> "$GITHUB_OUTPUT"
+
+        if [ "$CODE" != "200" ] && [ "$CODE" != "202" ]; then
+          echo "::error::Deploy webhook returned HTTP ${CODE}"
           exit 1
         fi
 
-    # ── 3. Update GitHub Deployment record (opt-in) ─────────────────────────
+        if [ "$CODE" = "202" ]; then
+          echo "::warning::Deploy queued for admin approval (queueId=${QUEUE_ID}). Waiting 60s then checking status via a fresh OIDC token..."
+          sleep 60
+
+          # Mint a fresh OIDC token — same mechanism as initial deploy, no PAT needed
+          FRESH_TOKEN=$(curl -sf \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oidc-deploy-webhook" \
+            | jq -r '.value')
+
+          if [ -z "$FRESH_TOKEN" ] || [ "$FRESH_TOKEN" = "null" ]; then
+            echo "::error::Could not mint OIDC token for status check"
+            exit 1
+          fi
+          echo "::add-mask::${FRESH_TOKEN}"
+
+          STATUS_RESP=$(curl -s -w "\n%{http_code}" \
+            "${WEBHOOK_URL}/deploy-status/${QUEUE_ID}" \
+            -H "Authorization: Bearer ${FRESH_TOKEN}")
+          STATUS_BODY=$(echo "$STATUS_RESP" | head -n -1)
+          STATUS_HTTP=$(echo "$STATUS_RESP" | tail -n1)
+
+          echo "Status check: HTTP ${STATUS_HTTP}"
+          echo "$STATUS_BODY" | jq . 2>/dev/null || echo "$STATUS_BODY"
+
+          if [ "$STATUS_HTTP" != "200" ]; then
+            echo "::error::Deploy status check failed (HTTP ${STATUS_HTTP})"
+            exit 1
+          fi
+
+          DEPLOY_STATUS=$(echo "$STATUS_BODY" | jq -r '.status // empty')
+          echo "status=${DEPLOY_STATUS}" >> "$GITHUB_OUTPUT"
+
+          case "$DEPLOY_STATUS" in
+            success|running)
+              echo "Deploy was approved and is ${DEPLOY_STATUS}."
+              exit 0
+              ;;
+            failed)
+              echo "::error::Deploy was approved but the playbook failed — check ${WEBHOOK_URL}/api/logs/${QUEUE_ID}"
+              exit 1
+              ;;
+            pending)
+              echo "::error::Deploy still pending after 60s — admin did not approve in time. Approve on the dashboard then re-run this workflow."
+              exit 1
+              ;;
+            denied|forbidden)
+              echo "::error::Deploy was denied by the approval system."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unknown deploy status '${DEPLOY_STATUS}' — check the webhook dashboard."
+              exit 1
+              ;;
+          esac
+        fi
+
+    # ── 3. Update GitHub Deployment record ──────────────────────────────────
+    # Runs for both synchronous (200) and post-poll (202 → approved) outcomes.
+    # job.status reflects the real result: 0 = success, 1 = failed/denied/timeout.
     - name: Update GitHub Deployment status
       if: always() && inputs.create-deployment == 'true'
       uses: bobheadxi/deployments@v1
