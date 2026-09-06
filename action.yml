@@ -216,7 +216,7 @@ runs:
               echo "::error::Deploy was approved but the playbook failed — check ${WEBHOOK_URL}/api/logs/${QUEUE_ID}"
               exit 1
               ;;
-            pending)
+            pending|pending-approval)
               echo "::error::Deploy still pending after 60s — admin did not approve in time. Approve on the dashboard then re-run this workflow."
               exit 1
               ;;
