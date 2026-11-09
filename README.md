@@ -58,7 +58,7 @@ on:
   workflow_dispatch:
 jobs:
   deploy:
-    uses: rsxdalv/ansible-deploy-action/.github/workflows/k8s-apply.yml@v1
+    uses: rsxdalv/ansible-deploy-action/.github/workflows/k8s-apply.yml@v2
     permissions: {contents: read, id-token: write}
 ```
 
