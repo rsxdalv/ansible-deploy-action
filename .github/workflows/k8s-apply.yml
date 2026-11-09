@@ -1,0 +1,114 @@
+# Reusable workflow: build an app image with its deploy/ folder embedded, push it to zot and deploy it
+# to k3s through the ansible-hooks `k8s-apply` service (experiments tier). The repo needs no secrets
+# and no entry in ansible-hooks or k3s-gitops: the first deploy waits for an approval in the
+# ansible.ttswebui.com dashboard, later pushes deploy directly.
+#
+# Caller (.github/workflows/k8s-apply.yml in the app repo):
+#
+#   name: k8s-apply
+#   on:
+#     push: {branches: [main]}
+#     pull_request: {branches: [main]}
+#     workflow_dispatch:
+#   jobs:
+#     deploy:
+#       uses: rsxdalv/ansible-deploy-action/.github/workflows/k8s-apply.yml@v2
+#       permissions: {contents: read, id-token: write}
+#
+# App repo layout: Dockerfile + deploy/values.yaml (+ optional deploy/secrets.sops.yaml, deploy/extra/).
+# Pull requests only build. Pushes to main build, push and deploy.
+name: k8s-apply
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Docker build context
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path (relative to the repo root)
+        type: string
+        default: Dockerfile
+      deploy-dir:
+        description: Folder holding values.yaml (embedded into the image as the dev.ttswebui.deploy label)
+        type: string
+        default: deploy
+      webhook-url:
+        description: ansible-hooks base URL
+        type: string
+        default: https://ansible.ttswebui.com
+      registry:
+        type: string
+        default: registry.dev.ttswebui.com
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  k8s-apply:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: k8s-apply-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check and bundle deploy/
+        id: bundle
+        env:
+          DEPLOY_DIR: ${{ inputs.deploy-dir }}
+        run: |
+          set -euo pipefail
+          [ -f "$DEPLOY_DIR/values.yaml" ] || { echo "::error::$DEPLOY_DIR/values.yaml is missing"; exit 1; }
+          python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); assert isinstance(d, dict), "values.yaml must be a mapping"' "$DEPLOY_DIR/values.yaml"
+          if [ -f "$DEPLOY_DIR/secrets.sops.yaml" ] && ! grep -q 'ENC\[' "$DEPLOY_DIR/secrets.sops.yaml"; then
+            echo "::error::$DEPLOY_DIR/secrets.sops.yaml is not SOPS-encrypted"; exit 1
+          fi
+          # Reproducible archive: same deploy/ -> same label -> same image digest.
+          parent=$(dirname "$DEPLOY_DIR"); base=$(basename "$DEPLOY_DIR")
+          b64=$(tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+                  --transform "s|^$base|deploy|" -C "$parent" -cf - "$base" | gzip -n | base64 -w0)
+          [ ${#b64} -lt 390000 ] || { echo "::error::deploy/ bundle too large (${#b64} bytes base64)"; exit 1; }
+          echo "label=$b64" >> "$GITHUB_OUTPUT"
+          echo "image=${{ inputs.registry }}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to zot with an OIDC token
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: |
+          set -euo pipefail
+          token=$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${REGISTRY}" | jq -r '.value')
+          [ -n "$token" ] && [ "$token" != "null" ] || { echo "no OIDC token returned" >&2; exit 1; }
+          echo "::add-mask::$token"
+          printf '%s' "$token" | docker login "$REGISTRY" -u oauth --password-stdin
+
+      - name: Build (push on main)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ${{ steps.bundle.outputs.image }}:${{ github.sha }}
+            ${{ steps.bundle.outputs.image }}:main
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            dev.ttswebui.deploy=${{ steps.bundle.outputs.label }}
+
+      - name: Deploy to k3s (k8s-apply, by digest)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: rsxdalv/ansible-deploy-action@v1
+        with:
+          webhook-url: ${{ inputs.webhook-url }}
+          service: k8s-apply
+          version: ${{ steps.build.outputs.digest }}
