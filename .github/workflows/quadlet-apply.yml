@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
           [ -f "$DEPLOY_DIR/service.yml" ] || { echo "::error::$DEPLOY_DIR/service.yml is missing (unit: <main unit name>)"; exit 1; }
           unit=$(python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); print(d["unit"])' "$DEPLOY_DIR/service.yml")
-          ls "$DEPLOY_DIR/$unit.container" "$DEPLOY_DIR/$unit.container.j2" 2>/dev/null | grep -q . \
+          [ -f "$DEPLOY_DIR/$unit.container" ] || [ -f "$DEPLOY_DIR/$unit.container.j2" ] \
             || { echo "::error::$DEPLOY_DIR/$unit.container(.j2) is missing"; exit 1; }
           if [ -n "$APP" ] && ! [[ "$APP" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; then echo "::error::app must be a short lowercase name"; exit 1; fi
           if [ -f "$DEPLOY_DIR/secrets.sops.yaml" ] && ! grep -q 'ENC\[' "$DEPLOY_DIR/secrets.sops.yaml"; then
